@@ -18,7 +18,6 @@ import io
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import pandas as pd
@@ -283,78 +282,52 @@ class LeadEnricherPipeline:
 
     # ── Main run loop ─────────────────────────────────────────────────────────
 
-    def run(self, max_workers: int = 5):
+    def run(self):
         """
-        Main processing loop. Runs until all rows done, stop requested,
-        or quota exhausted.
-        Call this in a background thread: threading.Thread(target=pipeline.run).start()
+        Main processing loop — simple sequential row-by-row.
+        Runs in a background thread until all rows are done, stop is
+        requested, or the Serper quota is exhausted.
         """
         with self.lock:
-            self.state["running"]      = True
+            self.state["running"]        = True
             self.state["stop_requested"] = False
             api_key = self.state["api_key"]
 
-        self._info(f"Pipeline started — {max_workers} workers")
+        self._info("Pipeline started — sequential mode")
 
-        # Create a shared requests session (connection pooling)
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0"})
 
         try:
-            # Identify rows to process (pending / unprocessed)
+            # Collect indices that still need processing
             pending_indices = []
             with self.lock:
                 for i, row in enumerate(self.state["rows"]):
-                    if row.get("status") not in ("done",):
+                    if row.get("status") != "done":
                         pending_indices.append(i)
                         row["status"] = "pending"
                         self.state["row_status"][i] = "pending"
 
             self._info(f"Rows to process: {len(pending_indices)}")
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit rows in batches equal to max_workers
-                i = 0
-                while i < len(pending_indices) and not self.stop_event.is_set():
-                    # Check if quota paused
-                    with self.lock:
-                        if self.state["paused_quota"]:
-                            break
+            for idx in pending_indices:
+                # Honour stop request between rows
+                if self.stop_event.is_set():
+                    self._info("Stop requested — halting.")
+                    break
 
-                    batch = pending_indices[i:i + max_workers]
-                    i += max_workers
-
-                    futures = {}
-                    for idx in batch:
-                        if self.stop_event.is_set():
-                            break
-                        with self.lock:
-                            row = self.state["rows"][idx]
-                        future = executor.submit(
-                            self._process_one, idx, row, api_key, session
-                        )
-                        futures[future] = idx
-
-                    # Wait for batch to complete
-                    quota_hit = False
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except (QuotaExhaustedError, InvalidKeyError):
-                            quota_hit = True
-                            # Cancel remaining futures in batch
-                            for f in futures:
-                                f.cancel()
-                            break
-                        except Exception:
-                            pass  # Already handled in _process_one
-
-                    if quota_hit:
+                # Honour quota pause
+                with self.lock:
+                    if self.state["paused_quota"]:
                         break
+                    row = self.state["rows"][idx]
 
-                    if self.stop_event.is_set():
-                        self._info("Stop requested — finishing current batch.")
-                        break
+                try:
+                    self._process_one(idx, row, api_key, session)
+                except (QuotaExhaustedError, InvalidKeyError):
+                    break   # _process_one already set paused_quota / failed
+                except Exception:
+                    pass    # _process_one already logged and marked failed
 
         except Exception as exc:
             self._error(f"Pipeline error: {str(exc)}")
@@ -362,7 +335,7 @@ class LeadEnricherPipeline:
         finally:
             session.close()
             with self.lock:
-                self.state["running"] = False
+                self.state["running"]     = False
                 self.state["in_progress"] = 0
 
             with self.lock:

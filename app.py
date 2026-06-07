@@ -62,19 +62,17 @@ def init_session():
     if "input_file_bytes" not in st.session_state:
         st.session_state.input_file_bytes = None
     if "processed_file_rows" not in st.session_state:
-        st.session_state.processed_file_rows = None   # rows loaded from prior output Excel
+        st.session_state.processed_file_rows = None
     if "confirm_clear" not in st.session_state:
         st.session_state.confirm_clear = False
-    if "new_api_key_input" not in st.session_state:
-        st.session_state.new_api_key_input = ""
 
 
 init_session()
 
 # Shorthand references
-PS    = st.session_state.pipeline_state
-LOCK  = st.session_state.state_lock
-STOP  = st.session_state.stop_event
+PS   = st.session_state.pipeline_state
+LOCK = st.session_state.state_lock
+STOP = st.session_state.stop_event
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -86,7 +84,7 @@ def is_running() -> bool:
     return t is not None and t.is_alive()
 
 
-def start_pipeline(max_workers: int):
+def start_pipeline():
     """Starts (or resumes) the background pipeline thread."""
     if is_running():
         return
@@ -94,16 +92,16 @@ def start_pipeline(max_workers: int):
     STOP.clear()
     with LOCK:
         PS["stop_requested"] = False
-        PS["running"] = True
+        PS["running"]        = True
 
     pipeline = LeadEnricherPipeline(PS, LOCK, STOP)
-    t = threading.Thread(target=pipeline.run, args=(max_workers,), daemon=True)
+    t = threading.Thread(target=pipeline.run, daemon=True)
     t.start()
     st.session_state.pipeline_thread = t
 
 
 def stop_pipeline():
-    """Signals the pipeline to stop after the current batch."""
+    """Signals the pipeline to stop after the current row."""
     STOP.set()
     with LOCK:
         PS["stop_requested"] = True
@@ -140,23 +138,24 @@ def status_emoji(status: str) -> str:
     }.get(status, "⏳")
 
 
-def api_badge(valid: bool | None) -> str:
+def api_badge(valid) -> str:
     if valid is True:
         return "🟢 API Key Valid"
     if valid is False:
         return "🔴 API Key Invalid"
-    return "🟡 API Key Not Verified"
+    return "🟡 Not Verified"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  SIDEBAR
+#  SIDEBAR  (does NOT cause dashboard blink — sidebar widgets use their own
+#            partial rerun in Streamlit; only full st.rerun() calls blink)
 # ──────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.title("🏭 IndiaMart\nLead Enricher")
     st.markdown("---")
 
-    # ── API Key ────────────────────────────────────────────────────────────────
+    # ── 1. Serper API Key ──────────────────────────────────────────────────────
     st.subheader("🔑 Serper API Key")
     api_key_input = st.text_input(
         "Enter your Serper API key",
@@ -164,6 +163,7 @@ with st.sidebar:
         value=PS.get("api_key", ""),
         placeholder="Paste key from serper.dev",
         help="Get a free key at https://serper.dev",
+        key="sidebar_api_key",
     )
 
     col_api1, col_api2 = st.columns(2)
@@ -186,27 +186,27 @@ with st.sidebar:
             badge_state = PS.get("api_valid")
         st.markdown(f"**{api_badge(badge_state)}**")
 
-    # Save key to state when changed
+    # Save key to state when it changes (without a verify click)
     if api_key_input.strip() and api_key_input.strip() != PS.get("api_key", ""):
         with LOCK:
             PS["api_key"]   = api_key_input.strip()
-            PS["api_valid"] = None  # Reset verification on change
+            PS["api_valid"] = None
 
     st.markdown("---")
 
-    # ── Already-Processed Output Upload ───────────────────────────────────────
+    # ── 2. Already-Processed Output Upload ────────────────────────────────────
     st.subheader("🔄 Resume from Previous Output")
     st.caption(
         "Upload a previously exported result Excel to skip already-processed "
-        "rows and continue from where you left off."
+        "rows and continue from the next pending one."
     )
     processed_file = st.file_uploader(
-        "Upload previously exported Excel (optional)",
+        "Previously exported Excel (optional)",
         type=["xlsx", "xls"],
         key="processed_excel_uploader",
         help=(
             "This should be the output file downloaded from a prior run. "
-            "Matched rows (by company name) will be marked as done automatically."
+            "Rows matched by company name will be marked done automatically."
         ),
     )
 
@@ -219,86 +219,79 @@ with st.sidebar:
         else:
             st.session_state.processed_file_rows = proc_rows
             st.success(
-                f"✅ Loaded **{processed_file.name}** — "
-                f"**{proc_done}** rows already done, will be skipped. "
-                f"Upload the sellers input file below to begin merging."
+                f"✅ **{processed_file.name}** loaded — "
+                f"**{proc_done}** rows already done."
             )
-
             # If input is already loaded, immediately merge
-            if PS.get("rows") and PS.get("input_filename"):
-                import io as _io
-                with LOCK:
-                    existing_input_bytes = st.session_state.input_file_bytes
-                if existing_input_bytes:
-                    df_in, err_in = load_input_excel(existing_input_bytes, PS["input_filename"])
-                    if not err_in:
-                        merged = merge_output_with_input(df_in, proc_rows, match_by_name=True)
-                        done_c = detect_resume_rows(merged)
-                        with LOCK:
-                            PS["rows"]       = merged
-                            PS["total"]      = len(merged)
-                            PS["processed"]  = done_c
-                            PS["failed"]     = sum(1 for r in merged if r.get("status") == "failed")
-                            PS["row_status"] = {i: r.get("status", "pending") for i, r in enumerate(merged)}
-                        st.info(f"▶ Merged — {done_c}/{len(merged)} rows already done.")
+            if PS.get("rows") and st.session_state.input_file_bytes:
+                df_in, err_in = load_input_excel(
+                    st.session_state.input_file_bytes, PS["input_filename"]
+                )
+                if not err_in:
+                    merged  = merge_output_with_input(df_in, proc_rows, match_by_name=True)
+                    done_c  = detect_resume_rows(merged)
+                    with LOCK:
+                        PS["rows"]       = merged
+                        PS["total"]      = len(merged)
+                        PS["processed"]  = done_c
+                        PS["failed"]     = sum(1 for r in merged if r.get("status") == "failed")
+                        PS["row_status"] = {i: r.get("status", "pending") for i, r in enumerate(merged)}
+                    st.info(f"▶ Merged — {done_c}/{len(merged)} rows already done.")
 
     elif st.session_state.processed_file_rows is not None:
         proc_done = detect_resume_rows(st.session_state.processed_file_rows)
-        st.info(f"ℹ️ Prior output active: **{proc_done}** rows will be skipped.")
+        st.info(f"ℹ️ Prior output active — **{proc_done}** rows will be skipped.")
         if st.button("🗑 Clear Prior Output", use_container_width=True, key="clear_proc"):
             st.session_state.processed_file_rows = None
             st.rerun()
 
     st.markdown("---")
 
-    # ── File Upload ────────────────────────────────────────────────────────────
-    st.subheader("📂 Input File")
+    # ── 3. Sellers Input File ──────────────────────────────────────────────────
+    st.subheader("📂 Sellers Input File")
     uploaded_file = st.file_uploader(
         "Upload Excel with company data",
         type=["xlsx", "xls"],
-        help="Expected columns: company_name, pincode, address (names detected automatically)",
+        help="Expected columns: company_name, pincode, address (auto-detected)",
+        key="input_excel_uploader",
     )
 
     if uploaded_file is not None:
         file_bytes = uploaded_file.read()
-        # Only reload if it's a new file
         if uploaded_file.name != PS.get("input_filename", "") or not PS["rows"]:
             df, err = load_input_excel(file_bytes, uploaded_file.name)
             if err:
                 st.error(f"❌ {err}")
             else:
-                # Determine resume source: prefer processed-output Excel over same-file resume
                 proc_rows = st.session_state.processed_file_rows
-
                 with LOCK:
                     existing = PS.get("rows", [])
 
                     if proc_rows:
-                        # Resume from previously exported output Excel (name-based match)
-                        new_rows = merge_output_with_input(df, proc_rows, match_by_name=True)
+                        # Resume from previously exported output Excel (name-based)
+                        new_rows   = merge_output_with_input(df, proc_rows, match_by_name=True)
                         done_count = detect_resume_rows(new_rows)
                         st.info(
                             f"▶ Resuming from prior output — "
-                            f"**{done_count}/{len(new_rows)}** rows already done, "
-                            f"continuing from next pending row."
+                            f"**{done_count}/{len(new_rows)}** rows already done."
                         )
                     elif existing and uploaded_file.name == PS.get("input_filename", ""):
-                        # Same file → positional resume: keep done rows
-                        new_rows = merge_output_with_input(df, existing)
+                        # Same file → positional resume
+                        new_rows   = merge_output_with_input(df, existing)
                         done_count = detect_resume_rows(new_rows)
                         st.info(f"▶ Resuming — {done_count}/{len(new_rows)} rows already done.")
                     else:
-                        # New file, no prior output → fresh start
+                        # Fresh start
                         new_rows = [
                             {
-                                "company_name": r["company_name"],
-                                "pincode": r["pincode"],
-                                "address": r["address"],
-                                "url_fetched": "",
-                                "match_type": "",
+                                "company_name":   r["company_name"],
+                                "pincode":        r["pincode"],
+                                "address":        r["address"],
+                                "url_fetched":    "",
+                                "match_type":     "",
                                 "contact_number": "",
-                                "status": "pending",
-                                "error": "",
+                                "status":         "pending",
+                                "error":          "",
                             }
                             for _, r in df.iterrows()
                         ]
@@ -317,17 +310,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Concurrency Slider ────────────────────────────────────────────────────
-    st.subheader("⚙️ Settings")
-    max_workers = st.slider(
-        "Parallel Workers",
-        min_value=1, max_value=10, value=5,
-        help="Number of concurrent company lookups. Higher = faster but more API load.",
-    )
-
-    st.markdown("---")
-
-    # ── Control Buttons ───────────────────────────────────────────────────────
+    # ── 4. Controls ────────────────────────────────────────────────────────────
     st.subheader("🎛️ Controls")
 
     has_data    = bool(PS.get("rows"))
@@ -336,17 +319,21 @@ with st.sidebar:
 
     col_s1, col_s2 = st.columns(2)
     with col_s1:
-        start_disabled = not has_data or not has_api_key or running
-        if st.button("▶ Start", disabled=start_disabled, use_container_width=True, type="primary"):
+        if st.button(
+            "▶ Start",
+            disabled=not has_data or not has_api_key or running,
+            use_container_width=True,
+            type="primary",
+        ):
             with LOCK:
                 PS["paused_quota"] = False
-            start_pipeline(max_workers)
+            start_pipeline()
             st.rerun()
 
     with col_s2:
         if st.button("⏹ Stop", disabled=not running, use_container_width=True):
             stop_pipeline()
-            st.info("Stop signal sent — finishing current batch...")
+            st.info("Stop signal sent — finishing current row...")
             time.sleep(1)
             st.rerun()
 
@@ -362,11 +349,10 @@ with st.sidebar:
                 time.sleep(0.5)
                 new_state = make_initial_state()
                 new_state["api_key"] = PS.get("api_key", "")
-                st.session_state.pipeline_state = new_state
-                PS = st.session_state.pipeline_state  # re-bind
-                st.session_state.input_file_bytes = None
+                st.session_state.pipeline_state      = new_state
+                st.session_state.input_file_bytes    = None
                 st.session_state.processed_file_rows = None
-                st.session_state.confirm_clear = False
+                st.session_state.confirm_clear       = False
                 st.rerun()
         with col_c2:
             if st.button("Cancel", use_container_width=True):
@@ -375,17 +361,17 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Download Button (always visible if data exists) ───────────────────────
+    # ── 5. Export ──────────────────────────────────────────────────────────────
     st.subheader("⬇️ Export")
     with LOCK:
-        all_rows = list(PS.get("rows", []))
-    done_rows = [r for r in all_rows if r.get("status") == "done"]
+        all_rows_export = list(PS.get("rows", []))
+    done_rows_export = [r for r in all_rows_export if r.get("status") == "done"]
 
-    if done_rows:
-        excel_bytes = export_to_excel(done_rows)
+    if done_rows_export:
+        excel_bytes = export_to_excel(done_rows_export)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
         st.download_button(
-            label=f"⬇ Download Excel ({len(done_rows)} rows)",
+            label=f"⬇ Download Excel ({len(done_rows_export)} rows)",
             data=excel_bytes,
             file_name=f"indiamart_leads_{ts}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -393,199 +379,221 @@ with st.sidebar:
             type="primary",
         )
     else:
-        st.button("⬇ Download Excel", disabled=True, use_container_width=True,
-                  help="Process some rows first to enable download.")
+        st.button(
+            "⬇ Download Excel",
+            disabled=True,
+            use_container_width=True,
+            help="Process some rows first to enable download.",
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MAIN DASHBOARD
+#  MAIN DASHBOARD  — wrapped in @st.fragment so auto-refresh only repaints
+#  this section, not the entire page (eliminates sidebar / input blink)
 # ──────────────────────────────────────────────────────────────────────────────
 
-st.title("🏭 IndiaMart Lead Enricher")
-st.caption("Automated B2B contact enrichment via Serper API + IndiaMart scraping")
+@st.fragment(run_every=3 if is_running() else None)
+def dashboard():
+    PS_d   = st.session_state.pipeline_state
+    LOCK_d = st.session_state.state_lock
 
-# ── Quota Exhausted Alert ─────────────────────────────────────────────────────
-with LOCK:
-    paused_quota = PS.get("paused_quota", False)
+    def _is_running():
+        t = st.session_state.pipeline_thread
+        return t is not None and t.is_alive()
 
-if paused_quota:
-    st.error(
-        "⚠️ **Serper API credits exhausted.** "
-        "Please enter a new API key below to continue. "
-        "Your progress has been saved and will resume from where it stopped.",
-        icon="🚨"
-    )
-    new_key = st.text_input(
-        "New Serper API Key",
-        type="password",
-        placeholder="Paste new key here...",
-        key="new_api_key_resume",
-    )
-    if st.button("▶ Resume with New Key", type="primary"):
-        if new_key.strip():
-            valid, msg = validate_api_key(new_key.strip())
-            if valid:
-                with LOCK:
-                    PS["api_key"]      = new_key.strip()
-                    PS["api_valid"]    = True
-                    PS["paused_quota"] = False
-                start_pipeline(max_workers)
-                st.success("✅ Resuming with new API key...")
-                time.sleep(1)
-                st.rerun()
+    def _get_stats():
+        with LOCK_d:
+            total     = PS_d["total"]
+            processed = PS_d["processed"]
+            failed    = PS_d["failed"]
+            in_prog   = PS_d["in_progress"]
+            remaining = max(0, total - processed - in_prog - failed)
+            credits   = PS_d["total_credits_used"]
+        return dict(total=total, processed=processed, failed=failed,
+                    in_progress=in_prog, remaining=remaining, credits=credits)
+
+    def _pct():
+        with LOCK_d:
+            total     = PS_d["total"]
+            processed = PS_d["processed"]
+            failed    = PS_d["failed"]
+        if total == 0:
+            return 0.0
+        return min(1.0, (processed + failed) / total)
+
+    st.title("🏭 IndiaMart Lead Enricher")
+    st.caption("Automated B2B contact enrichment via Serper API + IndiaMart scraping")
+
+    # ── Quota Exhausted Alert ──────────────────────────────────────────────────
+    with LOCK_d:
+        paused_quota = PS_d.get("paused_quota", False)
+
+    if paused_quota:
+        st.error(
+            "⚠️ **Serper API credits exhausted.** "
+            "Please enter a new API key in the sidebar to continue. "
+            "Your progress has been saved and will resume from where it stopped.",
+            icon="🚨",
+        )
+        new_key = st.text_input(
+            "New Serper API Key",
+            type="password",
+            placeholder="Paste new key here...",
+            key="new_api_key_resume",
+        )
+        if st.button("▶ Resume with New Key", type="primary"):
+            if new_key.strip():
+                valid, msg = validate_api_key(new_key.strip())
+                if valid:
+                    with LOCK_d:
+                        PS_d["api_key"]      = new_key.strip()
+                        PS_d["api_valid"]    = True
+                        PS_d["paused_quota"] = False
+                    start_pipeline()
+                    st.success("✅ Resuming with new API key...")
+                else:
+                    st.error(f"❌ {msg}")
             else:
-                st.error(f"❌ {msg}")
-        else:
-            st.warning("Please enter a key first.")
+                st.warning("Please enter a key first.")
+        st.markdown("---")
+
+    # ── Progress ───────────────────────────────────────────────────────────────
+    stats = _get_stats()
+    pct   = _pct()
+
+    st.markdown("### 📊 Progress")
+    st.progress(pct, text=f"{int(pct * 100)}% complete")
+
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("🏢 Total",       stats["total"])
+    col2.metric("✅ Processed",   stats["processed"])
+    col3.metric("🔄 In Progress", stats["in_progress"])
+    col4.metric("❌ Failed",      stats["failed"])
+    col5.metric("⏳ Remaining",   stats["remaining"])
+    col6.metric("💳 API Credits", stats["credits"])
+
+    running_now = _is_running()
+    if running_now:
+        st.info("🔄 **Processing in progress...** Dashboard refreshes automatically.")
+    elif stats["processed"] > 0 and stats["remaining"] == 0 and stats["total"] > 0:
+        st.success("🎉 **All companies processed!** Download your results from the sidebar.")
+
     st.markdown("---")
 
-# ── Progress Bar ──────────────────────────────────────────────────────────────
-stats = get_stats()
-pct   = get_completion_pct()
+    # ── Live Processing Table ──────────────────────────────────────────────────
+    with LOCK_d:
+        all_rows   = list(PS_d.get("rows", []))
+        row_status = dict(PS_d.get("row_status", {}))
 
-st.markdown("### 📊 Progress")
-st.progress(pct, text=f"{int(pct*100)}% complete")
+    if all_rows:
+        st.markdown("### 📋 Live Processing Status")
 
-# ── Stats Row ─────────────────────────────────────────────────────────────────
-col1, col2, col3, col4, col5, col6 = st.columns(6)
-col1.metric("🏢 Total",       stats["total"])
-col2.metric("✅ Processed",   stats["processed"])
-col3.metric("🔄 In Progress", stats["in_progress"])
-col4.metric("❌ Failed",      stats["failed"])
-col5.metric("⏳ Remaining",   stats["remaining"])
-col6.metric("💳 API Credits", stats["credits"])
+        processing_indices  = [i for i, s in row_status.items() if s == "processing"]
+        recent_done_indices = [
+            i for i, r in enumerate(all_rows) if r.get("status") == "done"
+        ][-20:]
 
-# Running indicator
-if is_running():
-    st.info("🔄 **Processing in progress...** Dashboard refreshes automatically.")
-elif stats["processed"] > 0 and stats["remaining"] == 0 and stats["total"] > 0:
-    st.success("🎉 **All companies processed!** Download your results from the sidebar.")
+        show_indices = sorted(set(processing_indices + recent_done_indices))
+        if not show_indices:
+            show_indices = list(range(min(20, len(all_rows))))
 
-st.markdown("---")
+        live_display = []
+        for i in show_indices:
+            if i < len(all_rows):
+                r = all_rows[i]
+                s = row_status.get(i, r.get("status", "pending"))
+                live_display.append({
+                    "#":       i + 1,
+                    "Status":  status_emoji(s) + " " + s.upper(),
+                    "Company": r.get("company_name", ""),
+                    "Pincode": r.get("pincode", ""),
+                    "URL":     r.get("url_fetched", "")[:60] or "—",
+                    "Match":   r.get("match_type", "") or "—",
+                    "Phone":   r.get("contact_number", "") or "—",
+                })
 
-# ── Live Processing Table ─────────────────────────────────────────────────────
-with LOCK:
-    all_rows    = list(PS.get("rows", []))
-    row_status  = dict(PS.get("row_status", {}))
+        if live_display:
+            st.dataframe(
+                pd.DataFrame(live_display),
+                use_container_width=True,
+                height=300,
+                hide_index=True,
+            )
+    else:
+        st.info("📂 Upload an Excel file from the sidebar to get started.")
 
-if all_rows:
-    st.markdown("### 📋 Live Processing Status")
+    st.markdown("---")
 
-    # Show current batch (processing + recently done), then rest
-    batch_size = max_workers * 2
-    processing_indices = [i for i, s in row_status.items() if s == "processing"]
-    recent_done_indices = [
-        i for i, r in enumerate(all_rows)
-        if r.get("status") == "done"
-    ][-batch_size:]
+    # ── Full Results Table ─────────────────────────────────────────────────────
+    done_rows = [r for r in all_rows if r.get("status") == "done"]
 
-    show_indices = sorted(set(processing_indices + recent_done_indices))
-    if not show_indices and all_rows:
-        # Show first N if nothing is processing yet
-        show_indices = list(range(min(20, len(all_rows))))
+    if done_rows:
+        st.markdown(f"### 📈 Results ({len(done_rows)} completed)")
 
-    live_display = []
-    for i in show_indices:
-        if i < len(all_rows):
-            r = all_rows[i]
-            s = row_status.get(i, r.get("status", "pending"))
-            live_display.append({
-                "#":       i + 1,
-                "Status":  status_emoji(s) + " " + s.upper(),
-                "Company": r.get("company_name", ""),
-                "Pincode": r.get("pincode", ""),
-                "URL":     r.get("url_fetched", "")[:60] or "—",
-                "Match":   r.get("match_type", "") or "—",
-                "Phone":   r.get("contact_number", "") or "—",
-            })
+        filter_col1, filter_col2 = st.columns(2)
+        with filter_col1:
+            filter_match = st.selectbox(
+                "Filter by Match Type",
+                options=["All", "name+pincode", "name+locality", "name_only", "— No URL"],
+                index=0,
+            )
+        with filter_col2:
+            filter_phone = st.selectbox(
+                "Filter by Contact",
+                options=["All", "Has Phone", "No Phone"],
+                index=0,
+            )
 
-    if live_display:
+        results_df = rows_to_dataframe(done_rows)
+
+        if filter_match != "All":
+            if filter_match == "— No URL":
+                results_df = results_df[results_df["IndiaMart URL"].str.strip() == ""]
+            else:
+                results_df = results_df[
+                    results_df["Match Type"].str.contains(filter_match, na=False)
+                ]
+
+        if filter_phone == "Has Phone":
+            results_df = results_df[
+                results_df["Contact Number"].str.strip().astype(bool)
+                & ~results_df["Contact Number"].isin(["Not Found", "No URL", "Scrape Error", ""])
+            ]
+        elif filter_phone == "No Phone":
+            results_df = results_df[
+                results_df["Contact Number"].isin(["Not Found", "No URL", "", "Scrape Error"])
+                | results_df["Contact Number"].str.strip().eq("")
+            ]
+
         st.dataframe(
-            pd.DataFrame(live_display),
+            results_df.drop(columns=["Status", "Error"], errors="ignore"),
             use_container_width=True,
-            height=300,
+            height=400,
             hide_index=True,
         )
-else:
-    st.info("📂 Upload an Excel file from the sidebar to get started.")
 
-st.markdown("---")
+    st.markdown("---")
 
-# ── Full Results Table ────────────────────────────────────────────────────────
-done_rows = [r for r in all_rows if r.get("status") == "done"]
+    # ── Log Console ────────────────────────────────────────────────────────────
+    st.markdown("### 🖥️ Processing Log")
+    with LOCK_d:
+        log_lines = list(PS_d.get("log_lines", []))
 
-if done_rows:
-    st.markdown(f"### 📈 Results ({len(done_rows)} completed)")
-
-    # Filters
-    filter_col1, filter_col2 = st.columns(2)
-    with filter_col1:
-        filter_match = st.selectbox(
-            "Filter by Match Type",
-            options=["All", "name+pincode", "name+locality", "name_only", "— No URL"],
-            index=0,
+    if log_lines:
+        st.text_area(
+            "Log Output (last 100 lines)",
+            value="\n".join(log_lines[-100:]),
+            height=200,
+            label_visibility="collapsed",
         )
-    with filter_col2:
-        filter_phone = st.selectbox(
-            "Filter by Contact",
-            options=["All", "Has Phone", "No Phone"],
-            index=0,
+    else:
+        st.text_area(
+            "Log Output",
+            value="Log entries will appear here once processing starts...",
+            height=150,
+            label_visibility="collapsed",
+            disabled=True,
         )
 
-    results_df = rows_to_dataframe(done_rows)
 
-    # Apply filters
-    if filter_match != "All":
-        match_val = "" if filter_match == "— No URL" else filter_match
-        if filter_match == "— No URL":
-            results_df = results_df[results_df["IndiaMart URL"].str.strip() == ""]
-        else:
-            results_df = results_df[results_df["Match Type"].str.contains(filter_match, na=False)]
-
-    if filter_phone == "Has Phone":
-        results_df = results_df[
-            results_df["Contact Number"].str.strip().astype(bool) &
-            ~results_df["Contact Number"].isin(["Not Found", "No URL", "Scrape Error", ""])
-        ]
-    elif filter_phone == "No Phone":
-        results_df = results_df[
-            results_df["Contact Number"].isin(["Not Found", "No URL", "", "Scrape Error"]) |
-            results_df["Contact Number"].str.strip().eq("")
-        ]
-
-    st.dataframe(
-        results_df.drop(columns=["Status", "Error"], errors="ignore"),
-        use_container_width=True,
-        height=400,
-        hide_index=True,
-    )
-
-st.markdown("---")
-
-# ── Log Console ───────────────────────────────────────────────────────────────
-st.markdown("### 🖥️ Processing Log")
-with LOCK:
-    log_lines = list(PS.get("log_lines", []))
-
-if log_lines:
-    # Show last 100 lines
-    log_text = "\n".join(log_lines[-100:])
-    st.text_area(
-        "Log Output (last 100 lines)",
-        value=log_text,
-        height=200,
-        label_visibility="collapsed",
-    )
-else:
-    st.text_area(
-        "Log Output",
-        value="Log entries will appear here once processing starts...",
-        height=150,
-        label_visibility="collapsed",
-        disabled=True,
-    )
-
-# ── Auto-refresh while running ────────────────────────────────────────────────
-if is_running():
-    time.sleep(2)
-    st.rerun()
+dashboard()
