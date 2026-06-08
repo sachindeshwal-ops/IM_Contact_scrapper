@@ -313,6 +313,27 @@ with st.sidebar:
     # ── 4. Controls ────────────────────────────────────────────────────────────
     st.subheader("🎛️ Controls")
 
+    # Selenium toggle
+    use_selenium = st.toggle(
+        "🌐 Use Selenium for phone extraction",
+        value=PS.get("use_selenium", True),
+        help=(
+            "Recommended ON. Selenium launches a headless Chrome browser, "
+            "clicks the 'Call Now' button on each IndiaMart page, and reads "
+            "the revealed number. Turn OFF only if Chrome/ChromeDriver is not "
+            "available — the static fallback rarely finds phone numbers on "
+            "modern IndiaMart pages."
+        ),
+    )
+    if use_selenium != PS.get("use_selenium", True):
+        with LOCK:
+            PS["use_selenium"] = use_selenium
+
+    if use_selenium:
+        st.caption("🟢 Chrome will be launched when processing starts.")
+    else:
+        st.caption("🟡 Static fallback — phone numbers may not be found.")
+
     has_data    = bool(PS.get("rows"))
     has_api_key = bool(PS.get("api_key", "").strip())
     running     = is_running()
@@ -348,7 +369,8 @@ with st.sidebar:
                 stop_pipeline()
                 time.sleep(0.5)
                 new_state = make_initial_state()
-                new_state["api_key"] = PS.get("api_key", "")
+                new_state["api_key"]      = PS.get("api_key", "")
+                new_state["use_selenium"] = PS.get("use_selenium", True)
                 st.session_state.pipeline_state      = new_state
                 st.session_state.input_file_bytes    = None
                 st.session_state.processed_file_rows = None

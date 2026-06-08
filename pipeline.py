@@ -27,6 +27,7 @@ from scraper_core import (
     process_company,
     QuotaExhaustedError,
     InvalidKeyError,
+    create_selenium_driver,
 )
 
 log = logging.getLogger("pipeline")
@@ -58,8 +59,9 @@ def make_initial_state() -> dict:
         "log_lines": [],
 
         # API tracking
-        "api_key": "",
+        "api_key":   "",
         "api_valid": None,    # None = unchecked, True/False
+        "use_selenium": True, # Use Selenium (Chrome) for phone extraction
         "total_credits_used": 0,
 
         # Input metadata
@@ -216,7 +218,8 @@ class LeadEnricherPipeline:
 
     # ── Worker: process one company ───────────────────────────────────────────
 
-    def _process_one(self, idx: int, row: dict, api_key: str, session: requests.Session):
+    def _process_one(self, idx: int, row: dict, api_key: str,
+                     session: requests.Session, driver=None):
         """
         Processes a single company row in a worker thread.
         Updates state in-place. Raises on quota/key errors.
@@ -232,7 +235,8 @@ class LeadEnricherPipeline:
         self._info(f"[{idx+1}] Processing: {name[:50]}")
 
         try:
-            result = process_company(name, pincode, address, api_key, session=session)
+            result = process_company(name, pincode, address, api_key,
+                                     session=session, driver=driver)
 
             with self.lock:
                 self.state["rows"][idx].update({
@@ -285,18 +289,35 @@ class LeadEnricherPipeline:
     def run(self):
         """
         Main processing loop — simple sequential row-by-row.
-        Runs in a background thread until all rows are done, stop is
-        requested, or the Serper quota is exhausted.
+        Spins up one headless Chrome driver (if use_selenium=True in state),
+        reuses it for every row, then quits it cleanly on exit.
         """
         with self.lock:
             self.state["running"]        = True
             self.state["stop_requested"] = False
-            api_key = self.state["api_key"]
+            api_key      = self.state["api_key"]
+            use_selenium = self.state.get("use_selenium", True)
 
-        self._info("Pipeline started — sequential mode")
+        self._info("Pipeline started — sequential mode"
+                   + (" | Selenium phone extraction" if use_selenium else " | Static phone extraction"))
 
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+        # ── Start Selenium driver ──────────────────────────────────────────────
+        driver = None
+        if use_selenium:
+            try:
+                self._info("Starting headless Chrome for phone extraction...")
+                driver = create_selenium_driver(headless=True)
+                self._info("Chrome driver ready ✓")
+            except Exception as exc:
+                self._warn(
+                    f"Could not start Selenium ({exc}). "
+                    "Falling back to static phone extraction — "
+                    "phone numbers may not be found on modern IndiaMart pages."
+                )
+                driver = None
 
         try:
             # Collect indices that still need processing
@@ -311,29 +332,34 @@ class LeadEnricherPipeline:
             self._info(f"Rows to process: {len(pending_indices)}")
 
             for idx in pending_indices:
-                # Honour stop request between rows
                 if self.stop_event.is_set():
                     self._info("Stop requested — halting.")
                     break
 
-                # Honour quota pause
                 with self.lock:
                     if self.state["paused_quota"]:
                         break
                     row = self.state["rows"][idx]
 
                 try:
-                    self._process_one(idx, row, api_key, session)
+                    self._process_one(idx, row, api_key, session, driver=driver)
                 except (QuotaExhaustedError, InvalidKeyError):
-                    break   # _process_one already set paused_quota / failed
+                    break
                 except Exception:
-                    pass    # _process_one already logged and marked failed
+                    pass
 
         except Exception as exc:
             self._error(f"Pipeline error: {str(exc)}")
 
         finally:
             session.close()
+            if driver is not None:
+                try:
+                    driver.quit()
+                    self._info("Chrome driver closed.")
+                except Exception:
+                    pass
+
             with self.lock:
                 self.state["running"]     = False
                 self.state["in_progress"] = 0
